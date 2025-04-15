@@ -1,0 +1,16 @@
+# Source files (we only need dist/ in the package)
+src/
+
+# Development configuration
+.github/
+.vscode/
+.idea/
+*.log
+
+# Test data
+summaries/*
+!summaries/.gitkeep
+
+
+# Build process
+tsconfig.json
