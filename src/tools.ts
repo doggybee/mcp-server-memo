@@ -198,3 +198,365 @@ export async function upsertSummary(params: z.infer<typeof upsertSummarySchema>,
     };
   }
 }
+
+// Implementation for getSummary tool - returns only the latest version
+export async function getSummary(params: z.infer<typeof getSummarySchema>, extra: any) {
+  try {
+    const { sessionId, maxLength } = params;
+    
+    // Find the latest file for this sessionId
+    const filePath = await findFileBySessionId(sessionId);
+    
+    if (!filePath) {
+      return {
+        content: [{ 
+          type: "text" as const, 
+          text: JSON.stringify({ 
+            success: false, 
+            error: `No summary found for session ${sessionId}` 
+          }) 
+        }],
+        isError: true
+      };
+    }
+    
+    // Read the data
+    let data = await readSummaryFile(filePath);
+    
+    // Apply maxLength if specified
+    if (maxLength !== undefined && data.summary.length > maxLength) {
+      data = {
+        ...data,
+        summary: data.summary.substring(0, maxLength) + '...'
+      };
+    }
+    
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({
+          success: true,
+          data: data,
+          isLatestVersion: true
+        }) 
+      }]
+    };
+  } catch (error) {
+    process.stderr.write(`Error in getSummary: ${error}\n`);
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: false, 
+          error: String(error) 
+        }) 
+      }],
+      isError: true
+    };
+  }
+}
+
+// Implementation for listSummaries tool - groups by sessionId and returns latest version of each
+export async function listSummaries(params?: z.infer<typeof listSummariesSchema>, extra?: any) {
+  try {
+    // Default parameters
+    const tag = params?.tag;
+    const limit = params?.limit;
+    const offset = params?.offset ?? 0;
+    const sortBy = params?.sortBy ?? 'lastUpdated';
+    const order = params?.order ?? 'desc';
+    
+    // Get all summary files
+    let fileInfos = await getSummaryFiles();
+    
+    // Apply initial sorting by filename (which contains timestamp) for 'lastUpdated' sort
+    if (sortBy === 'lastUpdated') {
+      fileInfos.sort((a, b) => {
+        return order === 'asc'
+          ? a.timestamp.localeCompare(b.timestamp)
+          : b.timestamp.localeCompare(a.timestamp);
+      });
+    }
+    
+    // Group by sessionId to get only the most recent version of each
+    const sessionMap = new Map<string, SummaryFileInfo>();
+    for (const fileInfo of fileInfos) {
+      // If we haven't seen this sessionId yet, or this is a newer version
+      if (!sessionMap.has(fileInfo.sessionId) || 
+          fileInfo.timestamp > sessionMap.get(fileInfo.sessionId)!.timestamp) {
+        sessionMap.set(fileInfo.sessionId, fileInfo);
+      }
+    }
+    
+    // Convert back to array
+    fileInfos = Array.from(sessionMap.values());
+    
+    // Apply pagination for 'lastUpdated' sort after grouping by sessionId
+    if (sortBy === 'lastUpdated' && limit !== undefined) {
+      const endIndex = offset + limit;
+      fileInfos = fileInfos.slice(offset, endIndex);
+    }
+    
+    // Load summary data for the (potentially filtered) file list
+    fileInfos = await loadSummaryData(fileInfos);
+    
+    // Filter by tag if specified
+    if (tag !== undefined) {
+      fileInfos = fileInfos.filter(
+        fileInfo => fileInfo.loaded && 
+                   fileInfo.data?.tags !== undefined && 
+                   fileInfo.data.tags.includes(tag)
+      );
+    }
+    
+    // Sort by title if requested
+    if (sortBy === 'title') {
+      fileInfos.sort((a, b) => {
+        const titleA = a.loaded && a.data?.title ? a.data.title : '';
+        const titleB = b.loaded && b.data?.title ? b.data.title : '';
+        return order === 'asc'
+          ? titleA.localeCompare(titleB)
+          : titleB.localeCompare(titleA);
+      });
+      
+      // Apply pagination for title sort
+      if (limit !== undefined) {
+        fileInfos = fileInfos.slice(offset, offset + limit);
+      }
+    }
+    
+    // Convert to result format
+    const summaries = fileInfos
+      .filter(fileInfo => fileInfo.loaded && fileInfo.data)
+      .map(fileInfo => {
+        const data = fileInfo.data!;
+        return {
+          sessionId: data.sessionId,
+          title: data.title || null,
+          tags: data.tags || [],
+          lastUpdated: data.lastUpdated,
+          summaryLength: data.summary.length,
+          isLatestVersion: true // This is guaranteed because we grouped by sessionId
+        };
+      });
+    
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: true, 
+          count: summaries.length,
+          summaries 
+        }) 
+      }]
+    };
+  } catch (error) {
+    process.stderr.write(`Error in listSummaries: ${error}\n`);
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: false, 
+          error: String(error) 
+        }) 
+      }],
+      isError: true
+    };
+  }
+}
+
+// Implementation for updateMetadata tool (optional)
+export async function updateMetadata(params: z.infer<typeof updateMetadataSchema>, extra: any) {
+  try {
+    const { sessionId, title, tags } = params;
+    
+    // Find the file for this sessionId
+    const filePath = await findFileBySessionId(sessionId);
+    
+    if (!filePath) {
+      return {
+        content: [{ 
+          type: "text" as const, 
+          text: JSON.stringify({ 
+            success: false, 
+            error: `No summary found for session ${sessionId}` 
+          }) 
+        }],
+        isError: true
+      };
+    }
+    
+    // Read existing data
+    const data = await readSummaryFile(filePath);
+    
+    // Update only the specified fields
+    let updated = false;
+    
+    if (title !== undefined && title !== data.title) {
+      data.title = title;
+      updated = true;
+    }
+    
+    if (tags !== undefined && 
+        (!data.tags || JSON.stringify(tags) !== JSON.stringify(data.tags))) {
+      data.tags = tags;
+      updated = true;
+    }
+    
+    if (!updated) {
+      return {
+        content: [{ 
+          type: "text" as const, 
+          text: JSON.stringify({ 
+            success: true, 
+            message: "No changes required - metadata already matches specified values",
+            sessionId
+          }) 
+        }]
+      };
+    }
+    
+    // Write the updated data back to the same file (preserve timestamp in filename)
+    await writeSummaryFile(filePath, data);
+    
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: true, 
+          message: `Metadata updated for session ${sessionId}`,
+          sessionId
+        }) 
+      }]
+    };
+  } catch (error) {
+    process.stderr.write(`Error in updateMetadata: ${error}\n`);
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: false, 
+          error: String(error) 
+        }) 
+      }],
+      isError: true
+    };
+  }
+}
+
+// Simplified tool to list all summaries without parsing
+export async function listAllSummaries(params: { simple?: boolean } = {}, extra: any) {
+  try {
+    // Always use the simple mode for better performance
+    const fileInfos = await getSummaryFiles();
+    
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: true, 
+          count: fileInfos.length,
+          summaries: fileInfos.map(info => ({
+            sessionId: info.sessionId,
+            timestamp: info.timestamp
+          }))
+        }) 
+      }]
+    };
+  } catch (error) {
+    process.stderr.write(`Error in listAllSummaries: ${error}\n`);
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: false, 
+          error: String(error) 
+        }) 
+      }],
+      isError: true
+    };
+  }
+}
+
+// Optimized tool to append content to a session summary - saving historical versions
+export async function appendSummary(params: { 
+  sessionId: string, 
+  content: string,
+  title?: string,
+  tags?: string[]
+}, extra: any) {
+  try {
+    await ensureSummariesDir();
+    
+    const { sessionId, content, title, tags } = params;
+    
+    // Prepare for atomic operations
+    let existingData: SummaryData | null = null;
+    const existingFilePath = await findFileBySessionId(sessionId);
+    
+    // Read existing data in a non-blocking way
+    if (existingFilePath) {
+      try {
+        existingData = await readSummaryFile(existingFilePath);
+      } catch (error) {
+        console.warn(`Warning: Could not read existing data for ${sessionId}, creating new summary`);
+      }
+    }
+    
+    // Generate new timestamp and filename
+    const newTimestamp = generateTimestamp();
+    const newFilename = generateFilename(sessionId, newTimestamp);
+    const newFilePath = path.join(config.summariesDir, newFilename);
+    
+    // Create or update summary - optimize string concatenation
+    const newSummary = existingData 
+      ? `${existingData.summary}\n\n${content}`
+      : content;
+    
+    // Prepare the data to store
+    const dataToStore: SummaryData = {
+      sessionId,
+      summary: newSummary,
+      lastUpdated: new Date().toISOString()
+    };
+    
+    // Add optional fields efficiently
+    if (title !== undefined) {
+      dataToStore.title = title;
+    } else if (existingData?.title) {
+      dataToStore.title = existingData.title;
+    }
+    
+    if (tags !== undefined) {
+      dataToStore.tags = tags;
+    } else if (existingData?.tags) {
+      dataToStore.tags = existingData.tags;
+    }
+    
+    // Atomic write operations - write to new file, but DON'T delete the old file
+    await writeSummaryFile(newFilePath, dataToStore);
+    
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: true, 
+          message: `Content appended to summary for session ${sessionId}`,
+          timestamp: newTimestamp
+        }) 
+      }]
+    };
+  } catch (error) {
+    process.stderr.write(`Error in appendSummary: ${error}\n`);
+    return {
+      content: [{ 
+        type: "text" as const, 
+        text: JSON.stringify({ 
+          success: false, 
+          error: String(error) 
+        }) 
+      }],
+      isError: true
+    };
+  }
+}
